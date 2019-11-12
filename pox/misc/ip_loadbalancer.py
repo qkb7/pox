@@ -32,6 +32,7 @@ from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.arp import arp
 from pox.lib.addresses import IPAddr, EthAddr
 from pox.lib.util import str_to_bool, dpid_to_str, str_to_dpid
+from pprint import pprint
 
 import pox.openflow.libopenflow_01 as of
 
@@ -74,17 +75,35 @@ class MemoryEntry (object):
   def key1 (self):
     ethp = self.first_packet
     ipp = ethp.find('ipv4')
+    if not ipp:
+      ipp = ethp.find('ipv6')
     tcpp = ethp.find('tcp')
-
-    return ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
+    if not tcpp: # my hack
+      icmp = ethp.find('icmp')
+      if not icmp:
+        icmpv6 = ethp.find('icmpv6')
+        return ipp.srcip,ipp.dstip,icmpv6
+      else:
+        return ipp.srcip,ipp.dstip,icmp
+    else:
+      return ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
 
   @property
   def key2 (self):
     ethp = self.first_packet
     ipp = ethp.find('ipv4')
+    if not ipp:
+      ipp = ethp.find('ipv6')
     tcpp = ethp.find('tcp')
-
-    return self.server,ipp.srcip,tcpp.dstport,tcpp.srcport
+    if not tcpp: # my hack
+      icmp = ethp.find('icmp')
+      if not icmp:
+        icmpv6 = ethp.find('icmpv6')
+        return ipp.srcip,ipp.dstip,icmpv6
+      else:
+        return ipp.srcip,ipp.dstip,icmp
+    else:
+      return ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
 
 
 class iplb (object):
@@ -206,9 +225,9 @@ class iplb (object):
         msg = of.ofp_packet_out(data = event.ofp)
         self.con.send(msg)
       return None
-
     tcpp = packet.find('tcp')
     if not tcpp:
+      print("===================\nin here")
       arpp = packet.find('arp')
       if arpp:
         # Handle replies to our server-liveness probes
@@ -226,85 +245,190 @@ class iplb (object):
               self.log.info("Server %s up", arpp.protosrc)
         return
 
-      # Not TCP and not ARP.  Don't know what to do with this.  Drop it.
-      return drop()
+      # print("packet: ")
+      # pprint(vars(packet))
+      # icmpp = packet.find('icmp')
+      # icmpv6p = packet.find('icmpv6') # can either search by packet.find() or packet.next.find() for ipv6/ipv4/icmp/icmpv6 (i.e. by name or next)
+      # icmpdp = packet.next.find('icmp')
+      # icmpv6dp = packet.next.find('icmpv6')
+      # print("found 4: ", icmpp)
+      # print("found 6: ", icmpv6p)
+      # print("found 4d: ", icmpdp)
+      # print("found: 6d ", icmpv6dp)
+      if packet.find('icmp') or packet.find('icmpv6'):
+        # print("packet: ")
+        # pprint(vars(packet))
+        print("found icmp")
+      else:
+        # Not TCP (edit: or icmp) and not ARP.  Don't know what to do with this.  Drop it.
+        return drop()
 
-    # It's TCP.
-
+    # It's TCP. (or icmp)
     ipp = packet.find('ipv4')
+    if not ipp:
+      ipp = packet.find('ipv6')
+      if not ipp:
+        print("dont know what this is")
+        return drop()
+      else:
+        print("got ipv6")
+        # pprint(vars(ipp.next))
+    else:
+      print("good ipv4")
 
     if ipp.srcip in self.servers:
       # It's FROM one of our balanced servers.
       # Rewrite it BACK to the client
 
-      key = ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
-      entry = self.memory.get(key)
+      if packet.find('tcp'):
+        print("got tcp back from server")
+        key = ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
+        entry = self.memory.get(key)
+        
+        if entry is None:
+          # We either didn't install it, or we forgot about it.
+          self.log.debug("No client for %s", key)
+          return drop()
 
-      if entry is None:
-        # We either didn't install it, or we forgot about it.
-        self.log.debug("No client for %s", key)
-        return drop()
+        # Refresh time timeout and reinstall.
+        entry.refresh()
 
-      # Refresh time timeout and reinstall.
-      entry.refresh()
+        #self.log.debug("Install reverse flow for %s", key)
 
-      #self.log.debug("Install reverse flow for %s", key)
+        # Install reverse table entry
+        mac,port = self.live_servers[entry.server]
 
-      # Install reverse table entry
-      mac,port = self.live_servers[entry.server]
+        actions = []
+        actions.append(of.ofp_action_dl_addr.set_src(self.mac))
+        actions.append(of.ofp_action_nw_addr.set_src(self.service_ip))
+        actions.append(of.ofp_action_output(port = entry.client_port))
+        match = of.ofp_match.from_packet(packet, inport)
 
-      actions = []
-      actions.append(of.ofp_action_dl_addr.set_src(self.mac))
-      actions.append(of.ofp_action_nw_addr.set_src(self.service_ip))
-      actions.append(of.ofp_action_output(port = entry.client_port))
-      match = of.ofp_match.from_packet(packet, inport)
+        msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
+                              idle_timeout=FLOW_IDLE_TIMEOUT,
+                              hard_timeout=of.OFP_FLOW_PERMANENT,
+                              data=event.ofp,
+                              actions=actions,
+                              match=match)
+        self.con.send(msg)
 
-      msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
-                            idle_timeout=FLOW_IDLE_TIMEOUT,
-                            hard_timeout=of.OFP_FLOW_PERMANENT,
-                            data=event.ofp,
-                            actions=actions,
-                            match=match)
-      self.con.send(msg)
+      ####################################################################################################################################
+
+      elif packet.find('icmp') or packet.find('icmpv6'):
+        print("got icmp back from server")
+        key = ipp.srcip,ipp.dstip # tcpp.srcport,tcpp.dstport # "ICMP has no ports and is neither TCP nor UDP"
+        entry = self.memory.get(key)
+        
+        if entry is None:
+          # We either didn't install it, or we forgot about it.
+          self.log.debug("No client for %s", key)
+          return drop()
+
+        # Refresh time timeout and reinstall.
+        entry.refresh()
+
+        #self.log.debug("Install reverse flow for %s", key)
+
+        # Install reverse table entry
+        mac,port = self.live_servers[entry.server]
+
+        actions = []
+        actions.append(of.ofp_action_dl_addr.set_src(self.mac))
+        actions.append(of.ofp_action_nw_addr.set_src(self.service_ip))
+        actions.append(of.ofp_action_output(port = entry.client_port))
+        match = of.ofp_match.from_packet(packet, inport)
+
+        msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
+                              idle_timeout=FLOW_IDLE_TIMEOUT,
+                              hard_timeout=of.OFP_FLOW_PERMANENT,
+                              data=event.ofp,
+                              actions=actions,
+                              match=match)
+        self.con.send(msg)
+
+
+
 
     elif ipp.dstip == self.service_ip:
       # Ah, it's for our service IP and needs to be load balanced
+      if packet.find('tcp'):
+        print("got tcp from client")
+        # Do we already know this flow?
+        key = ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
+        entry = self.memory.get(key)
+        if entry is None or entry.server not in self.live_servers:
+          # Don't know it (hopefully it's new!)
+          if len(self.live_servers) == 0:
+            self.log.warn("No servers!")
+            return drop()
 
-      # Do we already know this flow?
-      key = ipp.srcip,ipp.dstip,tcpp.srcport,tcpp.dstport
-      entry = self.memory.get(key)
-      if entry is None or entry.server not in self.live_servers:
-        # Don't know it (hopefully it's new!)
-        if len(self.live_servers) == 0:
-          self.log.warn("No servers!")
-          return drop()
+          # Pick a server for this flow
+          server = self._pick_server(key, inport)
+          self.log.debug("Directing traffic to %s", server)
+          entry = MemoryEntry(server, packet, inport)
+          self.memory[entry.key1] = entry
+          self.memory[entry.key2] = entry
 
-        # Pick a server for this flow
-        server = self._pick_server(key, inport)
-        self.log.debug("Directing traffic to %s", server)
-        entry = MemoryEntry(server, packet, inport)
-        self.memory[entry.key1] = entry
-        self.memory[entry.key2] = entry
+        # Update timestamp
+        entry.refresh()
 
-      # Update timestamp
-      entry.refresh()
+        # Set up table entry towards selected server
+        mac,port = self.live_servers[entry.server]
 
-      # Set up table entry towards selected server
-      mac,port = self.live_servers[entry.server]
+        actions = []
+        actions.append(of.ofp_action_dl_addr.set_dst(mac))
+        actions.append(of.ofp_action_nw_addr.set_dst(entry.server))
+        actions.append(of.ofp_action_output(port = port))
+        match = of.ofp_match.from_packet(packet, inport)
 
-      actions = []
-      actions.append(of.ofp_action_dl_addr.set_dst(mac))
-      actions.append(of.ofp_action_nw_addr.set_dst(entry.server))
-      actions.append(of.ofp_action_output(port = port))
-      match = of.ofp_match.from_packet(packet, inport)
+        msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
+                              idle_timeout=FLOW_IDLE_TIMEOUT,
+                              hard_timeout=of.OFP_FLOW_PERMANENT,
+                              data=event.ofp,
+                              actions=actions,
+                              match=match)
+        self.con.send(msg)
 
-      msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
-                            idle_timeout=FLOW_IDLE_TIMEOUT,
-                            hard_timeout=of.OFP_FLOW_PERMANENT,
-                            data=event.ofp,
-                            actions=actions,
-                            match=match)
-      self.con.send(msg)
+      ####################################################################################################################################
+
+      elif packet.find('icmp') or packet.find('icmpv6'):
+        print("got icmp from client")
+        # Do we already know this flow?
+        key = ipp.srcip,ipp.dstip
+        entry = self.memory.get(key)
+        if entry is None or entry.server not in self.live_servers:
+          # Don't know it (hopefully it's new!)
+          if len(self.live_servers) == 0:
+            self.log.warn("No servers!")
+            return drop()
+
+          # Pick a server for this flow
+          server = self._pick_server(key, inport)
+          self.log.debug("Directing traffic to %s", server)
+          print("Directing traffic to %s" % server)
+          entry = MemoryEntry(server, packet, inport)
+          self.memory[entry.key1] = entry
+          self.memory[entry.key2] = entry
+
+        # Update timestamp
+        entry.refresh()
+
+        # Set up table entry towards selected server
+        mac,port = self.live_servers[entry.server]
+
+        actions = []
+        actions.append(of.ofp_action_dl_addr.set_dst(mac))
+        actions.append(of.ofp_action_nw_addr.set_dst(entry.server))
+        actions.append(of.ofp_action_output(port = port))
+        match = of.ofp_match.from_packet(packet, inport)
+
+        msg = of.ofp_flow_mod(command=of.OFPFC_ADD,
+                              idle_timeout=FLOW_IDLE_TIMEOUT,
+                              hard_timeout=of.OFP_FLOW_PERMANENT,
+                              data=event.ofp,
+                              actions=actions,
+                              match=match)
+        self.con.send(msg)
 
 
 # Remember which DPID we're operating on (first one to connect)
