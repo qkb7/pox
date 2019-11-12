@@ -272,11 +272,12 @@ class iplb (object):
         return drop()
       else:
         print("got ipv6")
-        # pprint(vars(ipp.next))
+        # pprint(vars(ipp))
     else:
       print("good ipv4")
 
     if ipp.srcip in self.servers:
+      print("got message from server")
       # It's FROM one of our balanced servers.
       # Rewrite it BACK to the client
 
@@ -349,7 +350,8 @@ class iplb (object):
 
 
 
-    elif ipp.dstip == self.service_ip:
+    elif ipp.dstip == self.service_ip: # ipv6 messing things up.
+      print("got message from client")
       # Ah, it's for our service IP and needs to be load balanced
       if packet.find('tcp'):
         print("got tcp from client")
@@ -405,7 +407,8 @@ class iplb (object):
           # Pick a server for this flow
           server = self._pick_server(key, inport)
           self.log.debug("Directing traffic to %s", server)
-          print("Directing traffic to %s" % server)
+          # print("Directing traffic to %s" % server)
+          print("Directing %s to %s" % (ipp.srcip, server))
           entry = MemoryEntry(server, packet, inport)
           self.memory[entry.key1] = entry
           self.memory[entry.key2] = entry
