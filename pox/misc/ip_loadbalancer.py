@@ -146,6 +146,8 @@ class iplb (object):
     # As part of a gross hack, we now do this from elsewhere
     #self.con.addListeners(self)
 
+    self.robin = 0
+
   def _do_expire (self):
     """
     Expire probes and "memorized" flows
@@ -160,7 +162,7 @@ class iplb (object):
         self.outstanding_probes.pop(ip, None)
         if ip in self.live_servers:
           self.log.warn("Server %s down", ip)
-          del self.live_servers[ip]
+          # del self.live_servers[ip]
 
     # Expire old flows
     c = len(self.memory)
@@ -213,7 +215,9 @@ class iplb (object):
     """
     Pick a server for a (hopefully) new connection
     """
-    return random.choice(self.live_servers.keys())
+    # return random.choice(self.live_servers.keys())
+    self.robin += 1
+    return list(self.live_servers.keys())[self.robin%len(self.live_servers.keys())]
 
   def _handle_PacketIn (self, event):
     inport = event.port
